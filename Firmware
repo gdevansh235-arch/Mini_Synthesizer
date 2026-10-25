@@ -1,0 +1,746 @@
+```cpp
+/*
+  MINI SYNTHESIZER
+  Controller: ESP32-S3 N16R8
+  Audio DAC: PCM5102A
+  Keyboard: 36 keys (assumed 6x6 matrix)
+  Display: SSD1306 128x64 I2C OLED
+  Controls: 6 potentiometers, rotary encoder, joystick
+  Drum pads: 8 buttons + 8 addressable RGB LEDs
+
+  IMPORTANT:
+  Verify every GPIO against your specific ESP32-S3 board.
+  Keyboard matrix mapping must be confirmed from the donor keyboard.
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <math.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <FastLED.h>
+#include <driver/i2s_std.h>
+
+// =====================================================
+// CONFIGURATION
+// =====================================================
+
+#define NUM_KEYS       36
+#define ROWS           6
+#define COLS           6
+#define NUM_VOICES     8
+#define NUM_PADS       8
+#define NUM_POTS       6
+
+#define SAMPLE_RATE    22050
+#define AUDIO_FRAMES   128
+
+#define OLED_WIDTH     128
+#define OLED_HEIGHT    64
+#define OLED_RESET     -1
+#define OLED_ADDRESS   0x3C
+
+#define RGB_BRIGHTNESS 40
+
+// =====================================================
+// GPIO CONFIGURATION
+// Verify these pins for your ESP32-S3 board.
+// =====================================================
+
+// Six keyboard rows
+const int rowPins[ROWS] = {
+  9, 10, 11, 12, 13, 14
+};
+
+// Six keyboard columns
+const int colPins[COLS] = {
+  15, 16, 17, 18, 19, 20
+};
+
+// Six potentiometers
+const int potPins[NUM_POTS] = {
+  1, 2, 3, 4, 5, 6
+};
+
+// Joystick
+const int joystickXPin = 7;
+const int joystickYPin = 8;
+
+// Eight drum-pad buttons
+const int padPins[NUM_PADS] = {
+  21, 35, 36, 37, 38, 39, 47, 48
+};
+
+// RGB LEDs
+const int rgbPin = 40;
+
+// PCM5102A I2S
+const int I2S_BCLK = 41;
+const int I2S_LRCK = 42;
+const int I2S_DOUT = 43;
+
+// OLED
+const int OLED_SDA = 44;
+const int OLED_SCL = 45;
+
+// Rotary encoder
+const int encoderA = 46;
+const int encoderB = 33;
+const int encoderButton = 34;
+
+// =====================================================
+// GLOBAL OBJECTS
+// =====================================================
+
+Adafruit_SSD1306 display(
+  OLED_WIDTH,
+  OLED_HEIGHT,
+  &Wire,
+  OLED_RESET
+);
+
+CRGB leds[NUM_PADS];
+
+i2s_chan_handle_t audioChannel = nullptr;
+
+// =====================================================
+// KEYBOARD STATE
+// =====================================================
+
+bool rawKey[NUM_KEYS] = {};
+bool stableKey[NUM_KEYS] = {};
+
+unsigned long keyChangeTime[NUM_KEYS] = {};
+
+const unsigned long debounceTime = 20;
+
+const int FIRST_MIDI_NOTE = 48;
+
+// MIDI notes 48 through 83: C3 through B5.
+
+// =====================================================
+// AUDIO VOICES
+// =====================================================
+
+struct Voice {
+  bool active = false;
+  int midiNote = 0;
+
+  float phase = 0.0f;
+  float phaseIncrement = 0.0f;
+
+  float envelope = 0.0f;
+
+  unsigned long age = 0;
+};
+
+Voice voices[NUM_VOICES];
+
+unsigned long voiceCounter = 1;
+
+portMUX_TYPE voiceMux = portMUX_INITIALIZER_UNLOCKED;
+
+// =====================================================
+// CONTROLS
+// =====================================================
+
+float potValue[NUM_POTS] = {
+  0.5, 0.5, 0.5, 0.5, 0.5, 0.5
+};
+
+int joystickX = 2048;
+int joystickY = 2048;
+
+int selectedPatch = 0;
+
+const char* patchNames[] = {
+  "Sine",
+  "Bright",
+  "Soft"
+};
+
+const int NUM_PATCHES = 3;
+
+int lastEncoderA = HIGH;
+bool previousEncoderButton = false;
+
+bool previousPad[NUM_PADS] = {};
+
+unsigned long lastControlRead = 0;
+unsigned long lastDisplayUpdate = 0;
+
+// =====================================================
+// NOTE FREQUENCY
+// =====================================================
+
+float midiToFrequency(int note) {
+  return 440.0f *
+    powf(2.0f, (note - 69) / 12.0f);
+}
+
+// =====================================================
+// NOTE ON
+// =====================================================
+
+void noteOn(int midiNote) {
+
+  portENTER_CRITICAL(&voiceMux);
+
+  int slot = -1;
+
+  // Reuse an existing voice for the same note.
+  for (int i = 0; i < NUM_VOICES; i++) {
+    if (voices[i].active &&
+        voices[i].midiNote == midiNote) {
+      slot = i;
+      break;
+    }
+  }
+
+  // Find an unused voice.
+  if (slot < 0) {
+    for (int i = 0; i < NUM_VOICES; i++) {
+      if (!voices[i].active) {
+        slot = i;
+        break;
+      }
+    }
+  }
+
+  // Steal the oldest voice if all voices are busy.
+  if (slot < 0) {
+    slot = 0;
+
+    for (int i = 1; i < NUM_VOICES; i++) {
+      if (voices[i].age < voices[slot].age) {
+        slot = i;
+      }
+    }
+  }
+
+  voices[slot].active = true;
+  voices[slot].midiNote = midiNote;
+  voices[slot].phase = 0.0f;
+
+  voices[slot].phaseIncrement =
+    2.0f * PI *
+    midiToFrequency(midiNote) /
+    SAMPLE_RATE;
+
+  voices[slot].envelope = 0.0f;
+  voices[slot].age = voiceCounter++;
+
+  portEXIT_CRITICAL(&voiceMux);
+}
+
+// =====================================================
+// NOTE OFF
+// =====================================================
+
+void noteOff(int midiNote) {
+
+  portENTER_CRITICAL(&voiceMux);
+
+  for (int i = 0; i < NUM_VOICES; i++) {
+    if (voices[i].active &&
+        voices[i].midiNote == midiNote) {
+      voices[i].active = false;
+    }
+  }
+
+  portEXIT_CRITICAL(&voiceMux);
+}
+
+// =====================================================
+// WAVEFORM GENERATOR
+// =====================================================
+
+float generateWave(float phase, int patch) {
+
+  float sineWave = sinf(phase);
+
+  switch (patch) {
+
+    case 1:
+      // Brighter electronic tone
+      return 0.72f * sineWave +
+             0.28f * sinf(2.0f * phase);
+
+    case 2:
+      // Softer electronic tone
+      return 0.88f * sineWave +
+             0.12f * sinf(3.0f * phase);
+
+    default:
+      // Pure sine wave
+      return sineWave;
+  }
+}
+
+// =====================================================
+// I2S AUDIO INITIALIZATION
+// ESP-IDF standard I2S driver, used by Arduino Core 3.x
+// =====================================================
+
+bool initializeAudio() {
+
+  i2s_chan_config_t channelConfig =
+    I2S_CHANNEL_DEFAULT_CONFIG(
+      I2S_NUM_AUTO,
+      I2S_ROLE_MASTER
+    );
+
+  channelConfig.auto_clear = true;
+
+  if (i2s_new_channel(
+        &channelConfig,
+        &audioChannel,
+        nullptr) != ESP_OK) {
+
+    Serial.println("ERROR: I2S channel creation failed.");
+    return false;
+  }
+
+  i2s_std_config_t config = {};
+
+  config.clk_cfg =
+    I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE);
+
+  config.slot_cfg =
+    I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+      I2S_DATA_BIT_WIDTH_16BIT,
+      I2S_SLOT_MODE_STEREO
+    );
+
+  config.gpio_cfg.mclk = I2S_GPIO_UNUSED;
+  config.gpio_cfg.bclk = (gpio_num_t)I2S_BCLK;
+  config.gpio_cfg.ws = (gpio_num_t)I2S_LRCK;
+  config.gpio_cfg.dout = (gpio_num_t)I2S_DOUT;
+  config.gpio_cfg.din = I2S_GPIO_UNUSED;
+
+  if (i2s_channel_init_std_mode(
+        audioChannel,
+        &config) != ESP_OK) {
+
+    Serial.println("ERROR: I2S configuration failed.");
+    return false;
+  }
+
+  if (i2s_channel_enable(audioChannel) != ESP_OK) {
+
+    Serial.println("ERROR: I2S enable failed.");
+    return false;
+  }
+
+  Serial.println("I2S audio initialized.");
+
+  return true;
+}
+
+// =====================================================
+// AUDIO TASK
+// =====================================================
+
+void audioTask(void* parameter) {
+
+  int16_t audioBuffer[AUDIO_FRAMES * 2];
+
+  while (true) {
+
+    for (int n = 0; n < AUDIO_FRAMES; n++) {
+
+      float mixedSample = 0.0f;
+
+      portENTER_CRITICAL(&voiceMux);
+
+      for (int v = 0; v < NUM_VOICES; v++) {
+
+        if (!voices[v].active) {
+          continue;
+        }
+
+        // Simple attack envelope.
+        if (voices[v].envelope < 1.0f) {
+
+          voices[v].envelope += 0.004f;
+
+          if (voices[v].envelope > 1.0f) {
+            voices[v].envelope = 1.0f;
+          }
+        }
+
+        mixedSample +=
+          generateWave(
+            voices[v].phase,
+            selectedPatch
+          ) * voices[v].envelope;
+
+        voices[v].phase +=
+          voices[v].phaseIncrement;
+
+        if (voices[v].phase >= 2.0f * PI) {
+          voices[v].phase -= 2.0f * PI;
+        }
+      }
+
+      portEXIT_CRITICAL(&voiceMux);
+
+      // Knob 1 controls master volume.
+      float volume = potValue[0];
+
+      mixedSample *=
+        7000.0f / NUM_VOICES;
+
+      mixedSample *= volume;
+
+      if (mixedSample > 30000.0f) {
+        mixedSample = 30000.0f;
+      }
+
+      if (mixedSample < -30000.0f) {
+        mixedSample = -30000.0f;
+      }
+
+      int16_t sample = (int16_t)mixedSample;
+
+      // Duplicate mono signal to stereo.
+      audioBuffer[n * 2] = sample;
+      audioBuffer[n * 2 + 1] = sample;
+    }
+
+    size_t bytesWritten = 0;
+
+    i2s_channel_write(
+      audioChannel,
+      audioBuffer,
+      sizeof(audioBuffer),
+      &bytesWritten,
+      portMAX_DELAY
+    );
+  }
+}
+
+// =====================================================
+// KEYBOARD MATRIX SCANNING
+// =====================================================
+
+void scanKeyboard() {
+
+  for (int r = 0; r < ROWS; r++) {
+
+    // Set all rows inactive.
+    for (int i = 0; i < ROWS; i++) {
+      digitalWrite(rowPins[i], HIGH);
+    }
+
+    // Activate current row.
+    digitalWrite(rowPins[r], LOW);
+
+    delayMicroseconds(40);
+
+    for (int c = 0; c < COLS; c++) {
+
+      int index = r * COLS + c;
+
+      bool pressed =
+        digitalRead(colPins[c]) == LOW;
+
+      if (pressed != rawKey[index]) {
+
+        rawKey[index] = pressed;
+        keyChangeTime[index] = millis();
+      }
+
+      if ((millis() - keyChangeTime[index] >=
+           debounceTime) &&
+          stableKey[index] != rawKey[index]) {
+
+        stableKey[index] = rawKey[index];
+
+        int midiNote =
+          FIRST_MIDI_NOTE + index;
+
+        if (stableKey[index]) {
+          noteOn(midiNote);
+        } else {
+          noteOff(midiNote);
+        }
+      }
+    }
+  }
+
+  // All rows inactive after scanning.
+  for (int r = 0; r < ROWS; r++) {
+    digitalWrite(rowPins[r], HIGH);
+  }
+}
+
+// =====================================================
+// POTENTIOMETERS, JOYSTICK, ENCODER
+// =====================================================
+
+void readControls() {
+
+  if (millis() - lastControlRead < 20) {
+    return;
+  }
+
+  lastControlRead = millis();
+
+  for (int i = 0; i < NUM_POTS; i++) {
+
+    potValue[i] =
+      analogRead(potPins[i]) / 4095.0f;
+  }
+
+  joystickX = analogRead(joystickXPin);
+  joystickY = analogRead(joystickYPin);
+
+  // Read rotary encoder.
+  int currentA = digitalRead(encoderA);
+
+  if (currentA != lastEncoderA &&
+      currentA == LOW) {
+
+    if (digitalRead(encoderB) != currentA) {
+      selectedPatch++;
+    } else {
+      selectedPatch--;
+    }
+
+    if (selectedPatch < 0) {
+      selectedPatch = NUM_PATCHES - 1;
+    }
+
+    if (selectedPatch >= NUM_PATCHES) {
+      selectedPatch = 0;
+    }
+  }
+
+  lastEncoderA = currentA;
+
+  // Encoder push switch.
+  bool buttonDown =
+    digitalRead(encoderButton) == LOW;
+
+  if (buttonDown && !previousEncoderButton) {
+
+    Serial.print("Selected sound: ");
+    Serial.println(patchNames[selectedPatch]);
+  }
+
+  previousEncoderButton = buttonDown;
+}
+
+// =====================================================
+// RGB DRUM PADS
+// =====================================================
+
+void scanPads() {
+
+  for (int i = 0; i < NUM_PADS; i++) {
+
+    bool pressed =
+      digitalRead(padPins[i]) == LOW;
+
+    if (pressed && !previousPad[i]) {
+
+      // Basic electronic tones for now.
+      // Replace with drum samples in a later version.
+      noteOn(72 + i);
+
+      leds[i] = CHSV(i * 32, 255, 180);
+
+      FastLED.show();
+    }
+
+    if (!pressed && previousPad[i]) {
+
+      noteOff(72 + i);
+
+      leds[i] = CRGB::Black;
+
+      FastLED.show();
+    }
+
+    previousPad[i] = pressed;
+  }
+}
+
+// =====================================================
+// OLED DISPLAY
+// =====================================================
+
+void updateDisplay() {
+
+  if (millis() - lastDisplayUpdate < 150) {
+    return;
+  }
+
+  lastDisplayUpdate = millis();
+
+  int pressedKeys = 0;
+
+  for (int i = 0; i < NUM_KEYS; i++) {
+    if (stableKey[i]) {
+      pressedKeys++;
+    }
+  }
+
+  display.clearDisplay();
+
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.println("MINI SYNTH - ESP32-S3");
+
+  display.drawLine(
+    0, 10, 127, 10, SSD1306_WHITE
+  );
+
+  display.setCursor(0, 15);
+  display.print("Sound: ");
+  display.println(patchNames[selectedPatch]);
+
+  display.print("Keys pressed: ");
+  display.println(pressedKeys);
+
+  display.print("Volume: ");
+  display.print((int)(potValue[0] * 100));
+  display.println("%");
+
+  display.print("Joystick X: ");
+  display.println(joystickX);
+
+  display.print("Joystick Y: ");
+  display.println(joystickY);
+
+  display.display();
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(300);
+
+  // Keyboard rows.
+  for (int r = 0; r < ROWS; r++) {
+
+    pinMode(rowPins[r], OUTPUT);
+
+    digitalWrite(rowPins[r], HIGH);
+  }
+
+  // Keyboard columns.
+  for (int c = 0; c < COLS; c++) {
+
+    pinMode(colPins[c], INPUT_PULLUP);
+  }
+
+  // Drum pads.
+  for (int p = 0; p < NUM_PADS; p++) {
+
+    pinMode(padPins[p], INPUT_PULLUP);
+  }
+
+  // Analog controls.
+  analogReadResolution(12);
+
+  for (int p = 0; p < NUM_POTS; p++) {
+
+    pinMode(potPins[p], INPUT);
+  }
+
+  pinMode(joystickXPin, INPUT);
+  pinMode(joystickYPin, INPUT);
+
+  // Rotary encoder.
+  pinMode(encoderA, INPUT_PULLUP);
+  pinMode(encoderB, INPUT_PULLUP);
+  pinMode(encoderButton, INPUT_PULLUP);
+
+  // OLED.
+  Wire.begin(OLED_SDA, OLED_SCL);
+
+  if (!display.begin(
+        SSD1306_SWITCHCAPVCC,
+        OLED_ADDRESS)) {
+
+    Serial.println(
+      "OLED not detected. Check wiring."
+    );
+
+  } else {
+
+    display.clearDisplay();
+
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    display.setCursor(0, 0);
+    display.println("Mini Synthesizer");
+    display.println("Initializing...");
+
+    display.display();
+  }
+
+  // RGB LEDs.
+  FastLED.addLeds<
+    WS2812B,
+    40,
+    GRB
+  >(leds, NUM_PADS);
+
+  FastLED.setBrightness(RGB_BRIGHTNESS);
+  FastLED.clear(true);
+
+  // Audio.
+  if (!initializeAudio()) {
+
+    Serial.println(
+      "Audio initialization failed."
+    );
+  }
+
+  // Create audio task.
+  xTaskCreatePinnedToCore(
+    audioTask,
+    "SynthAudio",
+    8192,
+    nullptr,
+    3,
+    nullptr,
+    0
+  );
+
+  Serial.println();
+  Serial.println("Mini Synthesizer Ready");
+  Serial.println("36 keys");
+  Serial.println("8 voices");
+  Serial.println("PCM5102A audio");
+  Serial.println("8 RGB pads");
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop() {
+
+  scanKeyboard();
+
+  scanPads();
+
+  readControls();
+
+  updateDisplay();
+
+  delay(1);
+}
+```
