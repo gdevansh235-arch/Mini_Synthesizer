@@ -1,2 +1,5 @@
-# Mini_Synthesizer
-Mini_Synthesizer
+**Mini Synthesizer**
+
+A Mini synthesizer which works like a real synthesizer
+
+
